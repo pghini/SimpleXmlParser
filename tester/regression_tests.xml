@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<RegressionTests>
+
+ <!-- TC1: isTagNameBoundary - tag name prefix disambiguation
+      Old regex [\s*|>] would match '*' and '|' as tag boundary chars.
+      New code only accepts: whitespace, '>', '/'.
+      getTagsValues(msg, "Test") must NOT match <TestData> or <TestList>.
+      It should only match <Test> ... </Test> elements.
+  -->
+ <BoundaryTests>
+  <TestData>this is TestData, not Test</TestData>
+  <TestList>this is TestList, not Test</TestList>
+  <Test>this is the actual Test tag</Test>
+  <Test attr="val">Test with attribute</Test>
+  <Test/>
+  <Tester>not a match for Test either</Tester>
+ </BoundaryTests>
+
+ <!-- TC2: isTagNameBoundary - chars '*' and '|' after tag name
+      Old regex would consider '*' and '|' as valid boundaries after tag name.
+      These are NOT valid XML, but document the behavioral change.
+      With old code: getTagValue(msg, "foo") would have found <foo*bar> as a match.
+      With new code: it correctly does NOT match (requires space/>/slash boundary).
+  -->
+ <StarPipeBoundaryTests>
+  <foo*bar>old code would wrongly match this as foo tag</foo*bar>
+  <foo|baz>old code would wrongly match this as foo tag</foo|baz>
+  <foo>correct foo tag</foo>
+  <foo attr='x'>foo with space boundary</foo>
+  <foo/>
+ </StarPipeBoundaryTests>
+
+ <!-- TC3: Multiple double-quoted properties on same tag
+      Old regex (\w+(?:(?:-\w+)*)?=".*") was greedy: on two double-quoted
+      properties it would capture everything from first " to last " as one match.
+      New parser handles each property independently.
+  -->
+ <PropertyTests>
+  <item p1="alpha" p2="beta">two double-quoted props</item>
+  <item p1="hello world" p2="foo bar" p3="baz">three double-quoted props</item>
+  <item mixed="double" single='single'>mixed quote styles</item>
+  <item p1="value with 'inner single' quotes" p2="another">embedded quotes</item>
+ </PropertyTests>
+
+ <!-- TC4: Property names starting with dash (more permissive in new code)
+      Old regex required \w at start of property name.
+      New parser accepts '-' at start of key name.
+  -->
+ <DashPropertyTests>
+  <widget -data-id="123" -data-type="button">dash-prefixed attributes</widget>
+  <node data-value="abc" data-index="0">standard dashed attributes</node>
+ </DashPropertyTests>
+
+ <!-- TC5: Self-closing tags mixed with regular tags (empty tag detection) -->
+ <EmptyTagTests>
+  <entry/>
+  <entry />
+  <entry   />
+  <entry attr="x"/>
+  <entry attr="y" />
+  <entry>has content</entry>
+ </EmptyTagTests>
+
+</RegressionTests>

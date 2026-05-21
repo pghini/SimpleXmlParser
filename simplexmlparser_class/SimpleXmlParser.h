@@ -22,14 +22,13 @@ class SimpleXmlParser : public QObject
     Q_OBJECT
 
     QString m_StartTag;
+    QString m_cachedStartTagOpen;   // "<tag>"
+    QString m_cachedStartTagClose;  // "</tag>"
     QStringList m_TagsToSignal, m_parsedMessages;
     int m_lastTagPos;
     QString m_buffer;
     QMutex muxMsgList;
     int m_maxBufferSizeInBytes; //0 means unlmited and is the default
-
-    static bool findStartTagDelimiters(const QString &msg, const QString &tag, int offset, int &startIdx, int &endIdx);
-    static QString unquoteString(const QString &s);
 
 public:
     explicit SimpleXmlParser(QObject *parent=0);
@@ -38,7 +37,7 @@ public:
     enum ParseErrorEnumType { E_EndTagNotMatched, E_MessageTooBig };
 
     void setNotificationMode(const notificationMode aMode)      { m_notifyMode = aMode;         }
-    void setStartTag(const QString &aTag)                       { m_StartTag = aTag;            }
+    void setStartTag(const QString &aTag);
     void addTagToFind(const QString &aTag)                      { m_TagsToSignal.append(aTag);  }
     void addData(const QString &aMsgpart);
     QString getNextMessage();
@@ -73,9 +72,15 @@ public:
     static void test_getTag();
     static void test_getProperty();
     static void test_addData();
+    static void test_encodeEntities();
+    static void test_decodeEntitiesEdgeCases();
+    static void test_getDecodedTagHelpers();
+    static void test_addDataErrors();
+    static void test_bufferOps();
+    static void test_signals();
 
 signals:
-    void foundTag(QString tag, QString value);
+    //void foundTag(QString tag, QString value);
     void messageCompleted();
     void parsedMessage(QString msg);
     void parseErrorFound(ParseErrorEnumType);

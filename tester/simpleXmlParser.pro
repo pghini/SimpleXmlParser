@@ -13,6 +13,8 @@ SOURCES += main.cpp \
 
 unix {
 TEMPLATE = app
+# Workaround for Qt 6.8.x + Xcode 26 SDK: __yield not declared in qyieldcpu.h
+QMAKE_CXXFLAGS += -Wno-implicit-function-declaration
 }
 
 win32 {

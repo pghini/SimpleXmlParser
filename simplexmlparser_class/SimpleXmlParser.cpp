@@ -8,7 +8,166 @@
 
 #include <QDebug>
 #include <QStringList>
-#include <QRegularExpression>
+
+namespace {
+
+QString normalizeTagName(const QString &tag)
+{
+    // Fast path: check if normalization is needed
+    bool needsNormalization = false;
+    for (int i = 0; i < tag.length(); ++i) {
+        const QChar c = tag.at(i);
+        if (c == '<' || c == '>') {
+            needsNormalization = true;
+            break;
+        }
+    }
+    if (!needsNormalization) {
+        return tag;
+    }
+
+    QString out;
+    out.reserve(tag.length());
+    for (int i = 0; i < tag.length(); ++i) {
+        const QChar c = tag.at(i);
+        if (c != '<' && c != '>') {
+            out.append(c);
+        }
+    }
+    return out;
+}
+
+bool isTagNameBoundary(const QString &msg, int posAfterTagName)
+{
+    if (posAfterTagName >= msg.length()) {
+        return false;
+    }
+
+    const QChar separator = msg.at(posAfterTagName);
+    return separator.isSpace() || separator == '>' || separator == '/';
+}
+
+bool findStartTag(const QString &msg,
+                      const QString &startTagPrefix,
+                      int begin,
+                      int &startIdx,
+                      int &endIdx,
+                      bool &emptyTag)
+{
+    if (startTagPrefix.length() <= 1) {
+        return false;
+    }
+
+    int searchFrom = begin;
+
+    while (true) {
+        const int idx = msg.indexOf(startTagPrefix, searchFrom, Qt::CaseSensitive);
+        if (idx < 0) {
+            return false;
+        }
+
+        const int afterTagName = idx + startTagPrefix.length();
+        if (!isTagNameBoundary(msg, afterTagName)) {
+            searchFrom = idx + 1;
+            continue;
+        }
+
+        const int gtIdx = msg.indexOf('>', afterTagName);
+        if (gtIdx < 0) {
+            return false;
+        }
+
+        int maybeSlash = gtIdx - 1;
+        while (maybeSlash > afterTagName && msg.at(maybeSlash).isSpace()) {
+            --maybeSlash;
+        }
+
+        startIdx = idx;
+        endIdx = gtIdx;
+        emptyTag = (maybeSlash >= afterTagName && msg.at(maybeSlash) == '/');
+        return true;
+    }
+}
+
+QMap<QString, QString> parseTagProperties(const QString &msg,
+                                              const QString &startTagPrefix,
+                                              int startIdx,
+                                              int endIdx)
+{
+    QMap<QString, QString> map;
+
+    const int propsStart = startIdx + startTagPrefix.length();
+    const int propsLen = endIdx - propsStart;
+    if (propsLen <= 0) {
+        return map;
+    }
+
+    const QString props = msg.mid(propsStart, propsLen).trimmed();
+    int i = 0;
+    while (i < props.length()) {
+        while (i < props.length() && props.at(i).isSpace()) {
+            ++i;
+        }
+        if (i >= props.length()) {
+            break;
+        }
+
+        const int keyStart = i;
+        while (i < props.length()) {
+            const QChar c = props.at(i);
+            if (c.isLetterOrNumber() || c == '_' || c == '-') {
+                ++i;
+            }
+            else {
+                break;
+            }
+        }
+        if (i == keyStart) {
+            ++i;
+            continue;
+        }
+        const QString key = props.mid(keyStart, i - keyStart);
+
+        while (i < props.length() && props.at(i).isSpace()) {
+            ++i;
+        }
+        if (i >= props.length() || props.at(i) != '=') {
+            continue;
+        }
+        ++i;
+
+        while (i < props.length() && props.at(i).isSpace()) {
+            ++i;
+        }
+        if (i >= props.length()) {
+            break;
+        }
+
+        const QChar quote = props.at(i);
+        if (quote != '\'' && quote != '"') {
+            while (i < props.length() && !props.at(i).isSpace()) {
+                ++i;
+            }
+            continue;
+        }
+        ++i;
+
+        const int valueStart = i;
+        while (i < props.length() && props.at(i) != quote) {
+            ++i;
+        }
+        if (i >= props.length()) {
+            break;
+        }
+
+        map[key] = props.mid(valueStart, i - valueStart);
+        ++i;
+    }
+
+    return map;
+}
+
+}
 
 /*!
    \class SimpleXmlParser
@@ -33,6 +192,15 @@ SimpleXmlParser::setMaxBufferSize(int sizeInBytes)
 }
 
 
+void
+SimpleXmlParser::setStartTag(const QString &aTag)
+{
+    m_StartTag = aTag;
+    m_cachedStartTagOpen = "<" + aTag + ">";
+    m_cachedStartTagClose = "</" + aTag + ">";
+}
+
+
 QString
 SimpleXmlParser::getCurrentBuffer() const
 {
@@ -50,39 +218,114 @@ SimpleXmlParser::emptyBuffer()
 
 
 QString
-SimpleXmlParser::unquoteString(const QString &s)
-{
-    if ( s.at(0) == s.at(s.length()-1) && ( s.at(0) == '\'' || s.at(0) == '"' ) )
-        return s.mid(1, s.length() - 2);
-
-    return s;
-}
-
-
-
-QString
 SimpleXmlParser::decodeEntities(const QString &s)
 {
-    QString ret(s);
-    ret.replace("&amp;", "&").replace("&gt;", ">").replace("&lt;", "<").replace("&quot;", "\"").replace("&apos;", "'");
+    // Single-pass decode: scan once, build result
+    QString ret;
+    ret.reserve(s.length());
 
-    // remove invalid chars (replacement char has U+FFFD as unicode code)
-    ret.replace(QChar(0xFFFD), " ");
+    int i = 0;
+    while (i < s.length()) {
+        const QChar c = s.at(i);
 
-    QRegularExpression re("&#([0-9]+);|&#x([0-9A-F]+);",
-                          QRegularExpression::CaseInsensitiveOption | QRegularExpression::UseUnicodePropertiesOption);
+        // Handle replacement char
+        if (c == QChar(0xFFFD)) {
+            ret.append(' ');
+            ++i;
+            continue;
+        }
 
-    QRegularExpressionMatchIterator i = re.globalMatch(ret);
-    int offset = 0;
-    while (i.hasNext()) {
-        QRegularExpressionMatch match = i.next();
-        QString matched = match.captured(0);
-        int position = match.capturedStart();
-        int length = matched.length();
-        QString decoded = QChar(matched.startsWith("&#x") ? match.captured(2).toInt(0, 16) : match.captured(1).toInt(0, 10));
+        // Check for entity
+        if (c != '&') {
+            ret.append(c);
+            ++i;
+            continue;
+        }
 
-        ret.replace(position + offset, length, decoded);
-        offset += decoded.length() - length;
+        // Try to match entity starting at i
+        const int remaining = s.length() - i;
+
+        // Check named entities (longest first to avoid partial matches)
+        if (remaining >= 6 && s.at(i+1) == 'a' && s.at(i+2) == 'p' && s.at(i+3) == 'o' && s.at(i+4) == 's' && s.at(i+5) == ';') {
+            ret.append('\'');
+            i += 6;
+            continue;
+        }
+        if (remaining >= 6 && s.at(i+1) == 'q' && s.at(i+2) == 'u' && s.at(i+3) == 'o' && s.at(i+4) == 't' && s.at(i+5) == ';') {
+            ret.append('"');
+            i += 6;
+            continue;
+        }
+        if (remaining >= 5 && s.at(i+1) == 'a' && s.at(i+2) == 'm' && s.at(i+3) == 'p' && s.at(i+4) == ';') {
+            ret.append('&');
+            i += 5;
+            continue;
+        }
+        if (remaining >= 4 && s.at(i+1) == 'g' && s.at(i+2) == 't' && s.at(i+3) == ';') {
+            ret.append('>');
+            i += 4;
+            continue;
+        }
+        if (remaining >= 4 && s.at(i+1) == 'l' && s.at(i+2) == 't' && s.at(i+3) == ';') {
+            ret.append('<');
+            i += 4;
+            continue;
+        }
+
+        // Check numeric entity &#...;
+        if (remaining >= 4 && s.at(i + 1) == '#') {
+            const int afterHash = i + 2;
+            bool isHex = (s.at(afterHash) == 'x' || s.at(afterHash) == 'X');
+            int digitStart = isHex ? afterHash + 1 : afterHash;
+            int pos = digitStart;
+
+            while (pos < s.length()) {
+                const QChar dc = s.at(pos);
+                if (isHex) {
+                    if ((dc >= '0' && dc <= '9') || (dc >= 'a' && dc <= 'f') || (dc >= 'A' && dc <= 'F')) {
+                        ++pos;
+                    } else {
+                        break;
+                    }
+                } else {
+                    if (dc >= '0' && dc <= '9') {
+                        ++pos;
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+            if (pos > digitStart && pos < s.length() && s.at(pos) == ';') {
+                // Compute codepoint inline without allocating a QString
+                int codePoint = 0;
+                bool ok = true;
+                for (int d = digitStart; d < pos; ++d) {
+                    const ushort ch = s.at(d).unicode();
+                    int digit;
+                    if (ch >= '0' && ch <= '9') {
+                        digit = ch - '0';
+                    } else if (isHex && ch >= 'a' && ch <= 'f') {
+                        digit = ch - 'a' + 10;
+                    } else if (isHex && ch >= 'A' && ch <= 'F') {
+                        digit = ch - 'A' + 10;
+                    } else {
+                        ok = false;
+                        break;
+                    }
+                    codePoint = codePoint * (isHex ? 16 : 10) + digit;
+                }
+                if (ok && codePoint > 0) {
+                    ret.append(QChar(codePoint));
+                    i = pos + 1;
+                    continue;
+                }
+            }
+        }
+
+        // Not a recognized entity, keep the &
+        ret.append(c);
+        ++i;
     }
 
     return ret;
@@ -93,58 +336,37 @@ SimpleXmlParser::decodeEntities(const QString &s)
 QString
 SimpleXmlParser::encodeEntities(const QString &s, bool encodeNonAscii)
 {
-    QString ret(s);
-    if (encodeNonAscii)
-    {
-        uint len = ret.length();
-        uint i = 0;
-        while(i < len)
-        {
-            if(ret[i].unicode() > 128)
-            {
-                QString rp = "&#x" + QString::number(ret[i].unicode(), 16) + ";";
-                ret.replace(i, 1, rp);
-                len += rp.length() -1;
-                i += rp.length();
-            }
-            else
-            {
-                i++;
-            }
+    // Single-pass encode: scan once, build result
+    QString ret;
+    ret.reserve(s.length() + s.length() / 4); // estimate ~25% expansion
+
+    for (int i = 0; i < s.length(); ++i) {
+        const QChar c = s.at(i);
+        const ushort u = c.unicode();
+
+        if (c == '&') {
+            ret.append(QLatin1String("&amp;"));
+        } else if (c == '<') {
+            ret.append(QLatin1String("&lt;"));
+        } else if (c == '>') {
+            ret.append(QLatin1String("&gt;"));
+        } else if (c == '"') {
+            ret.append(QLatin1String("&quot;"));
+        } else if (c == '\'') {
+            ret.append(QLatin1String("&apos;"));
+        } else if (encodeNonAscii && u > 128) {
+            ret.append(QLatin1String("&#x"));
+            ret.append(QString::number(u, 16));
+            ret.append(';');
+        } else {
+            ret.append(c);
         }
     }
-    ret.replace("&", "&amp;").replace(">", "&gt;").replace("<", "&lt;").replace("\"", "&quot;").replace("'", "&apos;");
+
     return ret;
 }
 
 
-
-bool
-SimpleXmlParser::findStartTagDelimiters(const QString &i_msg, const QString &i_tagname, int i_beginidx, int &o_startIdx, int &o_endIdx)
-{
-    QRegularExpression rx("<"+i_tagname+"[>|\\s]");     //find the beginning of the start tag (we use the \\s to avoid mismatches
-    QRegularExpression endrx("(>|/>)");            //to check where the start tag ends (handling properties)
-
-
-    QRegularExpressionMatch startMatch = rx.match(i_msg, i_beginidx);
-        o_startIdx = startMatch.capturedStart();
-        if (!startMatch.hasMatch()) {
-            return false;
-        }
-
-        QRegularExpressionMatch endMatch = endrx.match(i_msg, o_startIdx);
-        o_endIdx = endMatch.capturedStart();
-        if (!endMatch.hasMatch()) {
-            return false;
-        }
-
-    #ifdef SXML_DBG
-        qDebug() << "Matched/captured text:" << endMatch.capturedTexts();
-        qDebug() << "idx, endix: " << o_startIdx << o_endIdx;
-    #endif
-
-        return endMatch.captured(1) == "/>";
-}
 
 
 
@@ -159,12 +381,20 @@ SimpleXmlParser::findStartTagDelimiters(const QString &i_msg, const QString &i_t
 QString
 SimpleXmlParser::getTagValue(const QString & i_msg, const QString & i_tag, int i_offset, QString defaultValue)
 {
-    QString tagname = i_tag;
-    tagname.remove(QRegularExpression("[<>]"));
-    QString endtag = "</" + tagname + ">";
+    const QString tagname = normalizeTagName(i_tag);
+    if (tagname.isEmpty()) {
+        return defaultValue;
+    }
 
-    int idx, endidx;
-    bool emptytag = findStartTagDelimiters(i_msg, tagname, i_offset, idx, endidx);
+    const QString startTagPrefix = "<" + tagname;
+    const QString endtag = "</" + tagname + ">";
+
+    int idx = -1;
+    int endidx = -1;
+    bool emptytag = false;
+    if (!findStartTag(i_msg, startTagPrefix, i_offset, idx, endidx, emptytag)) {
+        return defaultValue;
+    }
 
 #ifdef SXML_DBG
     qDebug() << "idx, endix: " << idx << endidx;
@@ -174,11 +404,12 @@ SimpleXmlParser::getTagValue(const QString & i_msg, const QString & i_tag, int i
     }
 
     //it was not empty... go on
-    int idx2 = i_msg.indexOf(endtag, idx);
+    const int valueStart = endidx + 1;
+    int idx2 = i_msg.indexOf(endtag, valueStart);
     if (idx < 0 || idx2 < 0)
         return defaultValue;
 
-    QString tag = i_msg.mid(endidx + 1, idx2 - (endidx + 1));
+    QString tag = i_msg.mid(valueStart, idx2 - valueStart);
     return tag;
 }
 
@@ -193,7 +424,7 @@ SimpleXmlParser::getDecodedTagValue(const QString &msg, const QString &tag, int 
 
 
 /*!
-  \brief this method counts the number of tag occurence in the message and then calls repeatedly the getTagValue passing the specific offset
+    \brief this method scans the message once and extracts all values for the requested tag
   \param _msg the entire message to parse
   \param _tag the tag we want to gather the values
   \return a list of string containing all the values of the specified tags
@@ -201,21 +432,47 @@ SimpleXmlParser::getDecodedTagValue(const QString &msg, const QString &tag, int 
 QStringList
 SimpleXmlParser::getTagsValues(const QString & _msg, const QString & _tag)
 {
-        QStringList vlist;
-        int idx,last=0;
-        QString ntag = _tag;
-        ntag.remove(QRegularExpression("[<>]"));
-        QRegularExpression rx("<" + ntag + "[\\s*|>]");
-        int numtags = _msg.count(rx);
-        for (int i=0; i<numtags; i++) {
-#ifdef SXML_DBG
-            qDebug() << "parsing loop " << i << " idx=" << last;
-#endif
-            idx = _msg.indexOf(rx,last);
-            vlist << getTagValue(_msg,_tag,idx);
-            last = idx+1;
-        }
+    QStringList vlist;
+    int idx = -1;
+    int endidx = -1;
+    int last = 0;
+    int loopCounter = 0;
+    bool emptyTag = false;
+    const QString ntag = normalizeTagName(_tag);
+
+    if (ntag.isEmpty()) {
         return vlist;
+    }
+
+    const QString startTagPrefix = "<" + ntag;
+    const QString endTag = "</" + ntag + ">";
+
+    while (findStartTag(_msg, startTagPrefix, last, idx, endidx, emptyTag)) {
+#ifdef SXML_DBG
+        qDebug() << "parsing loop " << loopCounter << " idx=" << last;
+#endif
+
+        if (emptyTag) {
+            vlist << "";
+            last = endidx + 1;
+        }
+        else {
+            const int valueStart = endidx + 1;
+            const int endTagIdx = _msg.indexOf(endTag, valueStart, Qt::CaseSensitive);
+            if (endTagIdx < 0) {
+                vlist << "";
+                last = valueStart;
+            }
+            else {
+                vlist << _msg.mid(valueStart, endTagIdx - valueStart);
+                last = endTagIdx + endTag.length();
+            }
+        }
+
+        ++loopCounter;
+    }
+
+    return vlist;
 }
 
 
@@ -225,7 +482,8 @@ SimpleXmlParser::getDecodedTagsValues(const QString &msg, const QString &tag)
 {
     QStringList rawValues = getTagsValues(msg, tag);
     QStringList retval;
-    foreach(QString rawVal, rawValues) {
+    retval.reserve(rawValues.size());
+    for (const QString &rawVal : rawValues) {
         retval << decodeEntities(rawVal);
     }
     return retval;
@@ -236,70 +494,20 @@ SimpleXmlParser::getDecodedTagsValues(const QString &msg, const QString &tag)
 QMap<QString, QString>
 SimpleXmlParser::getTagProperties(const QString &i_msg, const QString &i_tag, int i_offset)
 {
-    QMap<QString, QString> map;
-
-    QString tagname = i_tag;
-    tagname.remove(QRegularExpression("[<>]"));
-
-    int idx, endidx;
-    findStartTagDelimiters(i_msg, tagname, i_offset, idx, endidx);
-
-    QString tmpprop = i_msg.mid(idx + tagname.length() + 1, endidx - (idx + tagname.length() + 1) );
-
-#ifdef SXML_DBG
-    qDebug() << "Properties string: " << tmpprop;
-#endif
-
-    tmpprop.replace(QRegularExpression("\\s*=\\s*"),"=");
-
-#ifdef SXML_DBG
-    qDebug() << "sanitized Properties string: " << tmpprop.trimmed();
-#endif
-
-    QStringList sl;
-
-    QRegularExpression rx("(\\w+(?:(?:-\\w+)*)?=\".*\")", QRegularExpression::UseUnicodePropertiesOption);
-    QRegularExpressionMatchIterator rxMatchIterator = rx.globalMatch(tmpprop.trimmed());
-
-    while (rxMatchIterator.hasNext()) {
-        QRegularExpressionMatch match = rxMatchIterator.next();
-        if (match.hasMatch() && !match.captured(0).isEmpty()) {
-            sl << match.captured(0);
-        }
+    const QString tagname = normalizeTagName(i_tag);
+    if (tagname.isEmpty()) {
+        return QMap<QString, QString>();
     }
 
-    QRegularExpression rx2("(\\w+(?:(?:-\\w+)*)?='[^']*')", QRegularExpression::UseUnicodePropertiesOption);
-
-    QRegularExpressionMatchIterator rx2MatchIterator = rx2.globalMatch(tmpprop.trimmed());
-    while (rx2MatchIterator.hasNext()) {
-        QRegularExpressionMatch match = rx2MatchIterator.next();
-        sl << match.captured();
+    const QString startTagPrefix = "<" + tagname;
+    int idx = -1;
+    int endidx = -1;
+    bool emptyTag = false;
+    if (!findStartTag(i_msg, startTagPrefix, i_offset, idx, endidx, emptyTag)) {
+        return QMap<QString, QString>();
     }
 
-#ifdef SXML_DBG
-    qDebug() << "prop string list: " << sl;
-#endif
-
-    foreach (QString s, sl) {
-
-#ifdef SXML_DBG
-        qDebug() << "Found Property: " << s;
-#endif
-
-#if QT_VERSION < QT_VERSION_CHECK(5,14,0)
-        QStringList sl2 = s.trimmed().split("=",QString::SkipEmptyParts);
-#else
-        QStringList sl2 = s.trimmed().split("=",Qt::SkipEmptyParts);
-#endif
-
-#ifdef SXML_DBG
-        qDebug() << sl2;
-#endif
-
-        map[sl2.at(0).trimmed()] = unquoteString(sl2.at(1));
-    }
-
-    return map;
+    return parseTagProperties(i_msg, startTagPrefix, idx, endidx);
 }
 
 
@@ -309,18 +517,26 @@ SimpleXmlParser::getTagsProperties(const QString &i_msg, const QString &i_tag)
 {
     QList<QMap<QString, QString> >maplist;
 
-    int idx,last=0;
-    QString ntag = i_tag;
-    ntag.remove(QRegularExpression("[<>]"));
-    QRegularExpression rx("<" + ntag + "[\\s*|>]");
-    int numtags = i_msg.count(rx);
-    for (int i=0; i<numtags; i++) {
+    const QString ntag = normalizeTagName(i_tag);
+    if (ntag.isEmpty()) {
+        return maplist;
+    }
+
+    const QString startTagPrefix = "<" + ntag;
+    int idx = -1;
+    int endidx = -1;
+    int last = 0;
+    int loopCounter = 0;
+    bool emptyTag = false;
+
+    while (findStartTag(i_msg, startTagPrefix, last, idx, endidx, emptyTag)) {
 #ifdef SXML_DBG
-        qDebug() << "parsing loop " << i << " idx=" << last;
+        qDebug() << "parsing loop " << loopCounter << " idx=" << last;
 #endif
-        idx = i_msg.indexOf(rx,last);
-        maplist << getTagProperties(i_msg, i_tag, idx);
-        last = idx+1;
+
+        maplist << parseTagProperties(i_msg, startTagPrefix, idx, endidx);
+        last = endidx + 1;
+        ++loopCounter;
     }
 
     return maplist;
@@ -519,6 +735,327 @@ SimpleXmlParser::test_addData()
     qDebug() << "Test 1 passed\n----------\n";
 }
 
+void
+SimpleXmlParser::test_encodeEntities()
+{
+    // Named entities
+    Q_ASSERT(encodeEntities("&")  == "&amp;");
+    Q_ASSERT(encodeEntities("<")  == "&lt;");
+    Q_ASSERT(encodeEntities(">")  == "&gt;");
+    Q_ASSERT(encodeEntities("\"") == "&quot;");
+    Q_ASSERT(encodeEntities("'")  == "&apos;");
+    Q_ASSERT(encodeEntities("a&b<c>d\"e'f") == "a&amp;b&lt;c&gt;d&quot;e&apos;f");
+    qDebug() << "Test encode named entities passed\n----------\n";
+
+    // Non-ASCII: NOT encoded when encodeNonAscii=false (default)
+    const QString eAccent = QString(QChar(0x00E9)); // é
+    Q_ASSERT(encodeEntities(eAccent, false) == eAccent);
+    qDebug() << "Test encode non-ASCII flag=false passed\n----------\n";
+
+    // Non-ASCII: encoded when encodeNonAscii=true
+    const QString encoded = encodeEntities(eAccent, true);
+    Q_ASSERT(encoded == "&#xe9;");
+    qDebug() << "Test encode non-ASCII flag=true passed\n----------\n";
+
+    // Double-encoding bug fix: & inside &#xe9; must NOT be re-encoded to &amp;#xe9;
+    Q_ASSERT(!encoded.contains("&amp;"));
+    qDebug() << "Test no double-encoding passed\n----------\n";
+
+    // Round-trip: decodeEntities(encodeEntities(s)) == s
+    const QString original = QString("Alice & Bob < 3 > 1 ") + eAccent;
+    Q_ASSERT(decodeEntities(encodeEntities(original, true)) == original);
+    qDebug() << "Test encode/decode round-trip passed\n----------\n";
+}
+
+void
+SimpleXmlParser::test_decodeEntitiesEdgeCases()
+{
+    // Empty string
+    Q_ASSERT(decodeEntities("") == "");
+    qDebug() << "Test decode empty string passed\n----------\n";
+
+    // U+FFFD replacement character -> space
+    Q_ASSERT(decodeEntities(QString(QChar(0xFFFD))) == " ");
+    qDebug() << "Test decode U+FFFD -> space passed\n----------\n";
+
+    // Unrecognized & kept as-is (& copied, remaining chars copied normally)
+    Q_ASSERT(decodeEntities("&foo;")        == "&foo;");
+    Q_ASSERT(decodeEntities("alone & here") == "alone & here");
+    qDebug() << "Test decode unrecognized & kept as-is passed\n----------\n";
+
+    // Numeric entity without closing ; -> kept as-is (condition pos < length fails)
+    Q_ASSERT(decodeEntities("&#123")  == "&#123");
+    Q_ASSERT(decodeEntities("&#x1a")  == "&#x1a");
+    qDebug() << "Test decode numeric entity without ; passed\n----------\n";
+
+    // Decimal and hex numeric entities
+    Q_ASSERT(decodeEntities("&#233;") == QString(QChar(0x00E9)));
+    Q_ASSERT(decodeEntities("&#xe9;") == QString(QChar(0x00E9)));
+    Q_ASSERT(decodeEntities("&#xE9;") == QString(QChar(0x00E9))); // uppercase hex digits
+    qDebug() << "Test decode numeric entities (decimal and hex) passed\n----------\n";
+
+    // All named entities
+    Q_ASSERT(decodeEntities("&amp;")  == "&");
+    Q_ASSERT(decodeEntities("&lt;")   == "<");
+    Q_ASSERT(decodeEntities("&gt;")   == ">");
+    Q_ASSERT(decodeEntities("&quot;") == "\"");
+    Q_ASSERT(decodeEntities("&apos;") == "'");
+    qDebug() << "Test decode all named entities passed\n----------\n";
+}
+
+void
+SimpleXmlParser::test_getDecodedTagHelpers()
+{
+    const QString msg = "<pippo>alice &lt; bob &amp; '3 &gt; 1'</pippo>";
+
+    // getDecodedTagValue
+    Q_ASSERT(getDecodedTagValue(msg, "pippo") == "alice < bob & '3 > 1'");
+    qDebug() << "Test getDecodedTagValue passed\n----------\n";
+
+    // getDecodedTagValue with default on missing tag
+    Q_ASSERT(getDecodedTagValue(msg, "nonexistent", 0, "default") == "default");
+    qDebug() << "Test getDecodedTagValue default passed\n----------\n";
+
+    // getDecodedTagsValues
+    const QString multi = "<list><item>a &amp; b</item><item>&lt;c&gt;</item></list>";
+    const QStringList decodedList = getDecodedTagsValues(getTagValue(multi, "list"), "item");
+    Q_ASSERT(decodedList.size() == 2);
+    Q_ASSERT(decodedList.at(0) == "a & b");
+    Q_ASSERT(decodedList.at(1) == "<c>");
+    qDebug() << "Test getDecodedTagsValues passed\n----------\n";
+}
+
+void
+SimpleXmlParser::test_addDataErrors()
+{
+    // Test E_MessageTooBig: second addData not appended when buffer already over limit
+    {
+        SimpleXmlParser parser;
+        parser.setStartTag("msg");
+        parser.setMaxBufferSize(10);
+        // First add: buffer is empty (0 <= 10), data appended; no <msg> tag found
+        parser.addData("12345678901"); // 11 chars, stays in buffer
+        const int sizeBefore = parser.getCurrentBuffer().size();
+        Q_ASSERT(sizeBefore > 10);
+        // Second add: buffer.size() > 10 -> E_MessageTooBig emitted, return without appending
+        parser.addData("more");
+        Q_ASSERT(parser.getCurrentBuffer().size() == sizeBefore);
+        qDebug() << "Test E_MessageTooBig: buffer not grown passed\n----------\n";
+    }
+
+    // Test stray close-tag before open-tag: new code silently skips it
+    // and still correctly extracts the valid message that follows.
+    // Old code emitted E_EndTagNotMatched because it searched for </pippo> from buffer start.
+    // New code searches for </pippo> starting from idx (position of <pippo>), so skips the stray one.
+    {
+        SimpleXmlParser parser;
+        parser.setStartTag("pippo");
+        parser.addData("</pippo>garbage<pippo>valid content</pippo>");
+        Q_ASSERT(parser.hasPendingMessages());
+        Q_ASSERT(parser.getNextMessage() == "<pippo>valid content</pippo>");
+        Q_ASSERT(!parser.hasPendingMessages());
+        qDebug() << "Test stray close-tag silently skipped, valid message extracted passed\n----------\n";
+    }
+
+    // Test many buffered messages in a single addData (verifies loop, not recursion)
+    {
+        SimpleXmlParser parser;
+        parser.setStartTag("msg");
+        QString bigBatch;
+        for (int i = 0; i < 500; ++i) {
+            bigBatch += QString("<msg>message %1</msg>").arg(i);
+        }
+        parser.addData(bigBatch);
+        int count = 0;
+        while (parser.hasPendingMessages()) {
+            parser.getNextMessage();
+            ++count;
+        }
+        Q_ASSERT(count == 500);
+        qDebug() << "Test 500 messages in single addData (loop, no stack overflow) passed\n----------\n";
+    }
+}
+
+void
+SimpleXmlParser::test_bufferOps()
+{
+    SimpleXmlParser parser;
+    parser.setStartTag("pippo");
+
+    // Initial state
+    Q_ASSERT(parser.getCurrentBuffer().isEmpty());
+    Q_ASSERT(parser.getMaxBufferSize() == 0); // 0 = unlimited
+
+    // Partial message stays in buffer (no close tag yet)
+    parser.addData("<pippo>partial");
+    Q_ASSERT(parser.getCurrentBuffer() == "<pippo>partial");
+
+    // emptyBuffer clears it
+    parser.emptyBuffer();
+    Q_ASSERT(parser.getCurrentBuffer().isEmpty());
+
+    // setMaxBufferSize with valid values
+    parser.setMaxBufferSize(1024);
+    Q_ASSERT(parser.getMaxBufferSize() == 1024);
+    parser.setMaxBufferSize(0); // restore to unlimited
+    Q_ASSERT(parser.getMaxBufferSize() == 0);
+
+    // setMaxBufferSize with invalid value (-1) is ignored
+    parser.setMaxBufferSize(512);
+    parser.setMaxBufferSize(-1);
+    Q_ASSERT(parser.getMaxBufferSize() == 512);
+
+    qDebug() << "Test buffer ops passed\n----------\n";
+}
+
+void
+SimpleXmlParser::test_signals()
+{
+    // --- E_NotifyOnly (default) ---
+    // messageCompleted fires; parsedMessage and parseErrorFound do NOT fire.
+    {
+        SimpleXmlParser p;
+        p.setStartTag("msg");
+        bool completedFired = false;
+        bool parsedFired    = false;
+        bool errorFired     = false;
+        QObject::connect(&p, &SimpleXmlParser::messageCompleted,
+                         [&]{ completedFired = true; });
+        QObject::connect(&p, &SimpleXmlParser::parsedMessage,
+                         [&](const QString &){ parsedFired = true; });
+        QObject::connect(&p, &SimpleXmlParser::parseErrorFound,
+                         [&](ParseErrorEnumType){ errorFired = true; });
+        p.addData("<msg>hello</msg>");
+        Q_ASSERT(completedFired);
+        Q_ASSERT(!parsedFired);
+        Q_ASSERT(!errorFired);
+        Q_ASSERT(p.hasPendingMessages());
+        Q_ASSERT(p.getNextMessage() == "<msg>hello</msg>");
+        qDebug() << "Test signal E_NotifyOnly passed\n----------\n";
+    }
+
+    // --- E_DispatchMessage ---
+    // parsedMessage fires with correct content; messageCompleted and parseErrorFound do NOT fire.
+    {
+        SimpleXmlParser p;
+        p.setStartTag("msg");
+        p.setNotificationMode(SimpleXmlParser::E_DispatchMessage);
+        bool completedFired = false;
+        QString receivedMsg;
+        bool errorFired = false;
+        QObject::connect(&p, &SimpleXmlParser::messageCompleted,
+                         [&]{ completedFired = true; });
+        QObject::connect(&p, &SimpleXmlParser::parsedMessage,
+                         [&](const QString &m){ receivedMsg = m; });
+        QObject::connect(&p, &SimpleXmlParser::parseErrorFound,
+                         [&](ParseErrorEnumType){ errorFired = true; });
+        p.addData("<msg>dispatch</msg>");
+        Q_ASSERT(!completedFired);
+        Q_ASSERT(receivedMsg == "<msg>dispatch</msg>");
+        Q_ASSERT(!errorFired);
+        Q_ASSERT(p.hasPendingMessages());
+        qDebug() << "Test signal E_DispatchMessage passed\n----------\n";
+    }
+
+    // --- E_DispatchMessageAndDelete ---
+    // parsedMessage fires with correct content; messageCompleted and parseErrorFound do NOT fire.
+    // Message is NOT put in queue.
+    {
+        SimpleXmlParser p;
+        p.setStartTag("msg");
+        p.setNotificationMode(SimpleXmlParser::E_DispatchMessageAndDelete);
+        bool completedFired = false;
+        QString receivedMsg;
+        bool errorFired = false;
+        QObject::connect(&p, &SimpleXmlParser::messageCompleted,
+                         [&]{ completedFired = true; });
+        QObject::connect(&p, &SimpleXmlParser::parsedMessage,
+                         [&](const QString &m){ receivedMsg = m; });
+        QObject::connect(&p, &SimpleXmlParser::parseErrorFound,
+                         [&](ParseErrorEnumType){ errorFired = true; });
+        p.addData("<msg>delete</msg>");
+        Q_ASSERT(!completedFired);
+        Q_ASSERT(receivedMsg == "<msg>delete</msg>");
+        Q_ASSERT(!errorFired);
+        Q_ASSERT(!p.hasPendingMessages());
+        qDebug() << "Test signal E_DispatchMessageAndDelete passed\n----------\n";
+    }
+
+    // --- E_NotifyAndDispatch ---
+    // Both messageCompleted and parsedMessage fire; parseErrorFound does NOT fire.
+    // Message is also in queue.
+    {
+        SimpleXmlParser p;
+        p.setStartTag("msg");
+        p.setNotificationMode(SimpleXmlParser::E_NotifyAndDispatch);
+        bool completedFired = false;
+        QString receivedMsg;
+        bool errorFired = false;
+        QObject::connect(&p, &SimpleXmlParser::messageCompleted,
+                         [&]{ completedFired = true; });
+        QObject::connect(&p, &SimpleXmlParser::parsedMessage,
+                         [&](const QString &m){ receivedMsg = m; });
+        QObject::connect(&p, &SimpleXmlParser::parseErrorFound,
+                         [&](ParseErrorEnumType){ errorFired = true; });
+        p.addData("<msg>both</msg>");
+        Q_ASSERT(completedFired);
+        Q_ASSERT(receivedMsg == "<msg>both</msg>");
+        Q_ASSERT(!errorFired);
+        Q_ASSERT(p.hasPendingMessages());
+        Q_ASSERT(p.getNextMessage() == "<msg>both</msg>");
+        qDebug() << "Test signal E_NotifyAndDispatch passed\n----------\n";
+    }
+
+    // --- parseErrorFound(E_MessageTooBig) ---
+    // parseErrorFound fires with correct enum value; messageCompleted and parsedMessage do NOT fire.
+    {
+        SimpleXmlParser p;
+        p.setStartTag("msg");
+        p.setMaxBufferSize(10);
+        bool completedFired = false;
+        bool parsedFired    = false;
+        ParseErrorEnumType errorReceived = static_cast<ParseErrorEnumType>(-1);
+        QObject::connect(&p, &SimpleXmlParser::messageCompleted,
+                         [&]{ completedFired = true; });
+        QObject::connect(&p, &SimpleXmlParser::parsedMessage,
+                         [&](const QString &){ parsedFired = true; });
+        QObject::connect(&p, &SimpleXmlParser::parseErrorFound,
+                         [&](ParseErrorEnumType e){ errorReceived = e; });
+        p.addData("12345678901"); // 11 chars, appended (check was false on empty buffer)
+        p.addData("x");          // buffer.size() > 10 -> E_MessageTooBig, x rejected
+        Q_ASSERT(errorReceived == SimpleXmlParser::E_MessageTooBig);
+        Q_ASSERT(!completedFired);
+        Q_ASSERT(!parsedFired);
+        qDebug() << "Test signal parseErrorFound(E_MessageTooBig) passed\n----------\n";
+    }
+
+    // --- E_EndTagNotMatched is dead code in new implementation ---
+    // Old code: indexOf(closeTag) from buffer start -> idx2 < idx -> signal emitted.
+    // New code: indexOf(closeTag, idx) from open-tag pos -> idx2 >= idx always -> else branch unreachable.
+    // All three signals must NOT fire; valid message is extracted correctly.
+    {
+        SimpleXmlParser p;
+        p.setStartTag("msg");
+        bool completedFired = false;
+        bool parsedFired    = false;
+        bool errorFired     = false;
+        QObject::connect(&p, &SimpleXmlParser::messageCompleted,
+                         [&]{ completedFired = true; });
+        QObject::connect(&p, &SimpleXmlParser::parsedMessage,
+                         [&](const QString &){ parsedFired = true; });
+        QObject::connect(&p, &SimpleXmlParser::parseErrorFound,
+                         [&](ParseErrorEnumType){ errorFired = true; });
+        p.addData("</msg>garbage<msg>valid</msg>");
+        // In E_NotifyOnly (default), messageCompleted fires for the valid message
+        Q_ASSERT(completedFired);
+        Q_ASSERT(!parsedFired);
+        Q_ASSERT(!errorFired);   // E_EndTagNotMatched never emitted in new code
+        Q_ASSERT(p.hasPendingMessages());
+        Q_ASSERT(p.getNextMessage() == "<msg>valid</msg>");
+        qDebug() << "Test signal E_EndTagNotMatched dead code: no error, valid message extracted passed\n----------\n";
+    }
+}
+
 /************* END OF TEST FNXS ************/
 
 /*!
@@ -550,20 +1087,27 @@ SimpleXmlParser::addData(const QString &aMsgpart) {
 
     m_buffer.append(aMsgpart);
 
-    int idx = m_buffer.indexOf("<" + m_StartTag + ">");
-    int idx2 = m_buffer.indexOf("</" + m_StartTag + ">");
+    // Loop instead of recursion to avoid stack overflow with many buffered messages
+    while (true) {
+        int idx = m_buffer.indexOf(m_cachedStartTagOpen);
+        if (idx < 0) {
+            // No start tag at all, nothing to do
+            return;
+        }
 
-    if (idx2 < 0) { //entire message data did not fit in the read chunk!
+        int idx2 = m_buffer.indexOf(m_cachedStartTagClose, idx);
+
+        if (idx2 < 0) { //entire message data did not fit in the read chunk!
 #ifdef SXML_DBG
-        qDebug() << "############ SXML - Storing arrived data for next Chunk #############";
-        qDebug() << "SXML - Current buffer is:\n" << m_buffer;
+            qDebug() << "############ SXML - Storing arrived data for next Chunk #############";
+            qDebug() << "SXML - Current buffer is:\n" << m_buffer;
 #endif
-        return;
-    }
-    else {
-        if (idx >= 0 && idx < idx2) {//normal message
-            msg = m_buffer.mid(idx, idx2 - idx + 3 + m_StartTag.length()); //the three bytes are "</>" that sourrounds the star tag
-            m_buffer = m_buffer.mid(idx2 + 3 + m_StartTag.length());
+            return;
+        }
+
+        if (idx < idx2) {//normal message
+            msg = m_buffer.mid(idx, idx2 - idx + m_cachedStartTagClose.length());
+            m_buffer = m_buffer.mid(idx2 + m_cachedStartTagClose.length());
 #ifdef SXML_DBG
             qDebug() << "SXML - We got a message: " << msg;
             qDebug() << "SXML - Whats left in the buffer:\n" << m_buffer;
@@ -596,23 +1140,20 @@ SimpleXmlParser::addData(const QString &aMsgpart) {
             }
 
             //now if we still have something in the buffer we go for another check
-            if (!m_buffer.isEmpty()) {
-#ifdef SXML_DBG
-                qDebug() << "Buffer size is: "<< m_buffer.size() << " rechecking buffer!";
-#endif
-                addData("");
+            if (m_buffer.isEmpty()) {
+                return;
             }
+            // continue the while loop to process next message
         }
         else {
-            if (idx2 < idx) {
-                m_buffer = m_buffer.mid(idx);
+            // idx2 < idx: END tag is before START tag
+            m_buffer = m_buffer.mid(idx);
 #ifdef SXML_DBG
-                qCritical() << "SXML - END tag is *before* START tag... we probably lost a chunk, dropping remainder!";
-                qDebug() << "SXML - New buffer contents:\n" << m_buffer;
+            qCritical() << "SXML - END tag is *before* START tag... we probably lost a chunk, dropping remainder!";
+            qDebug() << "SXML - New buffer contents:\n" << m_buffer;
 #endif
-                emit parseErrorFound(E_EndTagNotMatched);
-                addData("");
-            }
+            emit parseErrorFound(E_EndTagNotMatched);
+            // continue the while loop to re-check
         }
     }
 }
