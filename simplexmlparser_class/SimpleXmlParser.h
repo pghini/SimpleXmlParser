@@ -34,7 +34,7 @@ public:
     explicit SimpleXmlParser(QObject *parent=0);
 
     enum notificationMode { E_NotifyOnly, E_DispatchMessage, E_DispatchMessageAndDelete, E_NotifyAndDispatch };
-    enum ParseErrorEnumType { E_EndTagNotMatched, E_MessageTooBig };
+    enum ParseErrorEnumType { E_EndTagNotMatched, E_MessageTooBig, E_UnexpectedData };
 
     void setNotificationMode(const notificationMode aMode)      { m_notifyMode = aMode;         }
     void setStartTag(const QString &aTag);

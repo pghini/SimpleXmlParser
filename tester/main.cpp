@@ -186,5 +186,6 @@ int main(int argc, char** argv) {
     testEmptyTagMixed(reg);
     qDebug() << "\n========== ALL REGRESSION TESTS PASSED ==========\n";
 
-return app.exec();
+    // Tests are synchronous: no event loop is required here.
+    return 0;
 }

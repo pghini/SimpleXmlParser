@@ -37,6 +37,16 @@ QString normalizeTagName(const QString &tag)
     return out;
 }
 
+bool hasNonWhitespaceBefore(const QString &msg, int end)
+{
+    for (int i = 0; i < end && i < msg.length(); ++i) {
+        if (!msg.at(i).isSpace()) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool isTagNameBoundary(const QString &msg, int posAfterTagName)
 {
     if (posAfterTagName >= msg.length()) {
@@ -843,18 +853,75 @@ SimpleXmlParser::test_addDataErrors()
         qDebug() << "Test E_MessageTooBig: buffer not grown passed\n----------\n";
     }
 
-    // Test stray close-tag before open-tag: new code silently skips it
-    // and still correctly extracts the valid message that follows.
-    // Old code emitted E_EndTagNotMatched because it searched for </pippo> from buffer start.
-    // New code searches for </pippo> starting from idx (position of <pippo>), so skips the stray one.
+    // Test stray close-tag before open-tag: the spurious </pippo> (idx2 < idx) is
+    // reported as E_EndTagNotMatched and dropped; the leftover "garbage" before the
+    // real <pippo> is then reported as E_UnexpectedData and dropped too; finally the
+    // valid message is extracted correctly.
     {
         SimpleXmlParser parser;
         parser.setStartTag("pippo");
+        QList<ParseErrorEnumType> errors;
+        QObject::connect(&parser, &SimpleXmlParser::parseErrorFound,
+                         [&](ParseErrorEnumType e){ errors.append(e); });
         parser.addData("</pippo>garbage<pippo>valid content</pippo>");
+        Q_ASSERT(errors.size() == 2);
+        Q_ASSERT(errors.at(0) == SimpleXmlParser::E_EndTagNotMatched);
+        Q_ASSERT(errors.at(1) == SimpleXmlParser::E_UnexpectedData);
         Q_ASSERT(parser.hasPendingMessages());
         Q_ASSERT(parser.getNextMessage() == "<pippo>valid content</pippo>");
         Q_ASSERT(!parser.hasPendingMessages());
-        qDebug() << "Test stray close-tag silently skipped, valid message extracted passed\n----------\n";
+        qDebug() << "Test stray close-tag + garbage: both errors emitted, valid message extracted passed\n----------\n";
+    }
+
+    // Test plain garbage before a start tag: E_UnexpectedData is emitted, the garbage
+    // is dropped, and the valid message that follows is extracted correctly.
+    {
+        SimpleXmlParser parser;
+        parser.setStartTag("pippo");
+        bool errorFired = false;
+        ParseErrorEnumType errorReceived = static_cast<ParseErrorEnumType>(-1);
+        QObject::connect(&parser, &SimpleXmlParser::parseErrorFound,
+                         [&](ParseErrorEnumType e){ errorFired = true; errorReceived = e; });
+        parser.addData("garbage<pippo>valid content</pippo>");
+        Q_ASSERT(errorFired);
+        Q_ASSERT(errorReceived == SimpleXmlParser::E_UnexpectedData);
+        Q_ASSERT(parser.hasPendingMessages());
+        Q_ASSERT(parser.getNextMessage() == "<pippo>valid content</pippo>");
+        Q_ASSERT(!parser.hasPendingMessages());
+        qDebug() << "Test garbage before start tag: E_UnexpectedData emitted, valid message extracted passed\n----------\n";
+    }
+
+    // Test whitespace/newlines between messages: this is legal and must NOT emit any
+    // error. Both messages are extracted correctly.
+    {
+        SimpleXmlParser parser;
+        parser.setStartTag("pippo");
+        bool errorFired = false;
+        QObject::connect(&parser, &SimpleXmlParser::parseErrorFound,
+                         [&](ParseErrorEnumType){ errorFired = true; });
+        parser.addData("<pippo>a</pippo>\n   \t<pippo>b</pippo>");
+        Q_ASSERT(!errorFired);
+        Q_ASSERT(parser.getNextMessage() == "<pippo>a</pippo>");
+        Q_ASSERT(parser.getNextMessage() == "<pippo>b</pippo>");
+        Q_ASSERT(!parser.hasPendingMessages());
+        qDebug() << "Test whitespace between messages: no error, both messages extracted passed\n----------\n";
+    }
+
+    // Test isolated close-tag with NO following start tag: E_EndTagNotMatched is
+    // emitted and the stray close tag is dropped from the buffer.
+    // A close tag with no matching start tag is always a parse error, whether or not
+    // a start tag follows it in the same buffer.
+    {
+        SimpleXmlParser parser;
+        parser.setStartTag("pippo");
+        bool errorFired = false;
+        QObject::connect(&parser, &SimpleXmlParser::parseErrorFound,
+                         [&](ParseErrorEnumType){ errorFired = true; });
+        parser.addData("</pippo>garbage");
+        Q_ASSERT(errorFired);
+        Q_ASSERT(!parser.hasPendingMessages());
+        Q_ASSERT(parser.getCurrentBuffer() == "garbage");
+        qDebug() << "Test isolated close-tag without start tag: error emitted, stray tag dropped passed\n----------\n";
     }
 
     // Test many buffered messages in a single addData (verifies loop, not recursion)
@@ -1029,30 +1096,89 @@ SimpleXmlParser::test_signals()
         qDebug() << "Test signal parseErrorFound(E_MessageTooBig) passed\n----------\n";
     }
 
-    // --- E_EndTagNotMatched is dead code in new implementation ---
-    // Old code: indexOf(closeTag) from buffer start -> idx2 < idx -> signal emitted.
-    // New code: indexOf(closeTag, idx) from open-tag pos -> idx2 >= idx always -> else branch unreachable.
-    // All three signals must NOT fire; valid message is extracted correctly.
+    // --- E_EndTagNotMatched emitted when a spurious close tag precedes the start tag ---
+    // A stray </msg> before <msg> (idx2 < idx) is detected and E_EndTagNotMatched is
+    // emitted; the stray tag is dropped and the valid message is still extracted correctly.
     {
         SimpleXmlParser p;
         p.setStartTag("msg");
+        ParseErrorEnumType errorReceived = static_cast<ParseErrorEnumType>(-1);
         bool completedFired = false;
         bool parsedFired    = false;
-        bool errorFired     = false;
+        QObject::connect(&p, &SimpleXmlParser::parseErrorFound,
+                         [&](ParseErrorEnumType e){ errorReceived = e; });
         QObject::connect(&p, &SimpleXmlParser::messageCompleted,
                          [&]{ completedFired = true; });
         QObject::connect(&p, &SimpleXmlParser::parsedMessage,
                          [&](const QString &){ parsedFired = true; });
-        QObject::connect(&p, &SimpleXmlParser::parseErrorFound,
-                         [&](ParseErrorEnumType){ errorFired = true; });
-        p.addData("</msg>garbage<msg>valid</msg>");
-        // In E_NotifyOnly (default), messageCompleted fires for the valid message
+        p.addData("</msg><msg>valid</msg>");
+        Q_ASSERT(errorReceived == SimpleXmlParser::E_EndTagNotMatched);
         Q_ASSERT(completedFired);
         Q_ASSERT(!parsedFired);
-        Q_ASSERT(!errorFired);   // E_EndTagNotMatched never emitted in new code
         Q_ASSERT(p.hasPendingMessages());
         Q_ASSERT(p.getNextMessage() == "<msg>valid</msg>");
-        qDebug() << "Test signal E_EndTagNotMatched dead code: no error, valid message extracted passed\n----------\n";
+        qDebug() << "Test signal E_EndTagNotMatched emitted for spurious close tag passed\n----------\n";
+    }
+
+    // --- E_UnexpectedData emitted when plain garbage precedes the start tag ---
+    // Data before <msg> that is not a close tag is unexpected: E_UnexpectedData is
+    // emitted, the garbage is dropped, and the valid message is extracted correctly.
+    {
+        SimpleXmlParser p;
+        p.setStartTag("msg");
+        ParseErrorEnumType errorReceived = static_cast<ParseErrorEnumType>(-1);
+        bool completedFired = false;
+        bool parsedFired    = false;
+        QObject::connect(&p, &SimpleXmlParser::parseErrorFound,
+                         [&](ParseErrorEnumType e){ errorReceived = e; });
+        QObject::connect(&p, &SimpleXmlParser::messageCompleted,
+                         [&]{ completedFired = true; });
+        QObject::connect(&p, &SimpleXmlParser::parsedMessage,
+                         [&](const QString &){ parsedFired = true; });
+        p.addData("garbage<msg>valid</msg>");
+        Q_ASSERT(errorReceived == SimpleXmlParser::E_UnexpectedData);
+        Q_ASSERT(completedFired);
+        Q_ASSERT(!parsedFired);
+        Q_ASSERT(p.hasPendingMessages());
+        Q_ASSERT(p.getNextMessage() == "<msg>valid</msg>");
+        qDebug() << "Test signal E_UnexpectedData emitted for garbage before start tag passed\n----------\n";
+    }
+
+    // --- Both errors emitted, in order, for a stray close tag followed by garbage ---
+    // "</msg>garbage<msg>valid</msg>" first drops the spurious </msg> (E_EndTagNotMatched),
+    // then drops the leftover "garbage" before <msg> (E_UnexpectedData).
+    {
+        SimpleXmlParser p;
+        p.setStartTag("msg");
+        QList<ParseErrorEnumType> errors;
+        QObject::connect(&p, &SimpleXmlParser::parseErrorFound,
+                         [&](ParseErrorEnumType e){ errors.append(e); });
+        p.addData("</msg>garbage<msg>valid</msg>");
+        Q_ASSERT(errors.size() == 2);
+        Q_ASSERT(errors.at(0) == SimpleXmlParser::E_EndTagNotMatched);
+        Q_ASSERT(errors.at(1) == SimpleXmlParser::E_UnexpectedData);
+        Q_ASSERT(p.hasPendingMessages());
+        Q_ASSERT(p.getNextMessage() == "<msg>valid</msg>");
+        qDebug() << "Test signal both errors (close tag + garbage) in order passed\n----------\n";
+    }
+
+    // --- Garbage BEFORE a spurious close tag: errors reported in positional order ---
+    // "gar</msg><msg>x</msg>": the leading "gar" precedes the stray </msg>, so
+    // E_UnexpectedData is emitted first, then E_EndTagNotMatched for the stray tag,
+    // and finally the valid message is extracted.
+    {
+        SimpleXmlParser p;
+        p.setStartTag("msg");
+        QList<ParseErrorEnumType> errors;
+        QObject::connect(&p, &SimpleXmlParser::parseErrorFound,
+                         [&](ParseErrorEnumType e){ errors.append(e); });
+        p.addData("gar</msg><msg>x</msg>");
+        Q_ASSERT(errors.size() == 2);
+        Q_ASSERT(errors.at(0) == SimpleXmlParser::E_UnexpectedData);
+        Q_ASSERT(errors.at(1) == SimpleXmlParser::E_EndTagNotMatched);
+        Q_ASSERT(p.hasPendingMessages());
+        Q_ASSERT(p.getNextMessage() == "<msg>x</msg>");
+        qDebug() << "Test signal garbage before spurious close tag (positional order) passed\n----------\n";
     }
 }
 
@@ -1090,12 +1216,34 @@ SimpleXmlParser::addData(const QString &aMsgpart) {
     // Loop instead of recursion to avoid stack overflow with many buffered messages
     while (true) {
         int idx = m_buffer.indexOf(m_cachedStartTagOpen);
+        int idx2 = m_buffer.indexOf(m_cachedStartTagClose);
+
+        // Spurious close tag: a close tag appears with no start tag before it
+        // (either there is no start tag at all, or the close tag precedes it).
+        // Any NON-whitespace data before it is unexpected too, so report it first
+        // (positional order), then report the stray close tag; finally drop
+        // everything up to and including it and re-check what is left.
+        if (idx2 >= 0 && (idx < 0 || idx2 < idx)) {
+            if (hasNonWhitespaceBefore(m_buffer, idx2)) {
+#ifdef SXML_DBG
+                qCritical() << "SXML - Unexpected data before spurious END tag, dropping it:\n"
+                            << m_buffer.left(idx2);
+#endif
+                emit parseErrorFound(E_UnexpectedData);
+            }
+            m_buffer = m_buffer.mid(idx2 + m_cachedStartTagClose.length());
+#ifdef SXML_DBG
+            qCritical() << "SXML - Spurious END tag with no matching START tag, dropping it.";
+            qDebug() << "SXML - New buffer contents:\n" << m_buffer;
+#endif
+            emit parseErrorFound(E_EndTagNotMatched);
+            continue;
+        }
+
         if (idx < 0) {
             // No start tag at all, nothing to do
             return;
         }
-
-        int idx2 = m_buffer.indexOf(m_cachedStartTagClose, idx);
 
         if (idx2 < 0) { //entire message data did not fit in the read chunk!
 #ifdef SXML_DBG
@@ -1105,7 +1253,17 @@ SimpleXmlParser::addData(const QString &aMsgpart) {
             return;
         }
 
-        if (idx < idx2) {//normal message
+        {//normal message
+            // Any NON-whitespace data before the start tag is unexpected (it has no
+            // start tag of its own, mirroring the spurious close-tag case). Report it
+            // and drop it. Inter-message whitespace/newlines are legal and ignored.
+            if (idx > 0 && hasNonWhitespaceBefore(m_buffer, idx)) {
+#ifdef SXML_DBG
+                qCritical() << "SXML - Unexpected data before START tag, dropping it:\n"
+                            << m_buffer.left(idx);
+#endif
+                emit parseErrorFound(E_UnexpectedData);
+            }
             msg = m_buffer.mid(idx, idx2 - idx + m_cachedStartTagClose.length());
             m_buffer = m_buffer.mid(idx2 + m_cachedStartTagClose.length());
 #ifdef SXML_DBG
@@ -1144,16 +1302,6 @@ SimpleXmlParser::addData(const QString &aMsgpart) {
                 return;
             }
             // continue the while loop to process next message
-        }
-        else {
-            // idx2 < idx: END tag is before START tag
-            m_buffer = m_buffer.mid(idx);
-#ifdef SXML_DBG
-            qCritical() << "SXML - END tag is *before* START tag... we probably lost a chunk, dropping remainder!";
-            qDebug() << "SXML - New buffer contents:\n" << m_buffer;
-#endif
-            emit parseErrorFound(E_EndTagNotMatched);
-            // continue the while loop to re-check
         }
     }
 }
